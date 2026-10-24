@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily LNMT Cloudflare edge-trust refresh
+
+[Timer]
+OnBootSec=2min
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=lnmt-edge.service
+
+[Install]
+WantedBy=timers.target

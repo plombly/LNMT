@@ -1,0 +1,5 @@
+#!/usr/bin/python3 -I
+import sys
+sys.path.insert(0, "/usr/local/lib")
+from lnmt_node.shell import main
+sys.exit(main())

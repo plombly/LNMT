@@ -1,0 +1,13 @@
+[Unit]
+Description=LAIka NGINx Management Terminal root actions for the web dashboard
+
+[Socket]
+ListenStream=/run/lnmt-admin.sock
+SocketUser=root
+SocketGroup=lnmt-web
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

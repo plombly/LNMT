@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""lnmt-web serve | setup-code | reset-password USER (root runs it as lnmt-web)."""
+import os
+import sys
+if os.geteuid() == 0:
+    # The dashboard's data belongs to lnmt-web: never write it as root.
+    os.execvp("runuser", ["runuser", "-u", "lnmt-web", "--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+sys.path.insert(0, "/usr/local/lib")
+from lnmt.web.server import main
+sys.exit(main())

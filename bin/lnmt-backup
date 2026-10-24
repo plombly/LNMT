@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+DEFAULT_OUTPUT = pathlib.Path("/var/backups/lnmt")
+
+ITEMS = [
+    ("/var/lib/lnmt", "var/lib/lnmt"),
+    ("/etc/lnmt", "etc/lnmt"),
+    ("/etc/nginx/lnmt-auth", "etc/nginx/lnmt-auth"),
+    ("/etc/nginx/lnmt-sink", "etc/nginx/lnmt-sink"),
+    ("/etc/nginx/lnmt-pages", "etc/nginx/lnmt-pages"),
+    (
+        "/etc/nginx/conf.d/cloudflare-realip.conf",
+        "etc/nginx/conf.d/cloudflare-realip.conf",
+    ),
+    (
+        "/etc/nginx/conf.d/00-lnmt-default-sink.conf",
+        "etc/nginx/conf.d/00-lnmt-default-sink.conf",
+    ),
+    ("/etc/nginx/conf.d/05-lnmt-common.conf", "etc/nginx/conf.d/05-lnmt-common.conf"),
+    ("/etc/nftables.conf", "etc/nftables.conf"),
+    (
+        "/etc/systemd/system/lnmt-ddns.service",
+        "etc/systemd/system/lnmt-ddns.service",
+    ),
+    (
+        "/etc/systemd/system/lnmt-ddns.timer",
+        "etc/systemd/system/lnmt-ddns.timer",
+    ),
+    (
+        "/etc/systemd/system/lnmt-edge.service",
+        "etc/systemd/system/lnmt-edge.service",
+    ),
+    (
+        "/etc/systemd/system/lnmt-edge.timer",
+        "etc/systemd/system/lnmt-edge.timer",
+    ),
+    (
+        "/var/backups/lnmt/lnmt-v2.1-final.tar.gz",
+        "release/lnmt-v2.1-final.tar.gz",
+    ),
+    # The web dashboard: accounts, settings, sessions, activity log, its
+    # certificate and nginx site, and the services.
+    ("/var/lib/lnmt-web", "var/lib/lnmt-web"),
+    ("/etc/nginx/lnmt-admin", "etc/nginx/lnmt-admin"),
+    ("/etc/nginx/conf.d/10-lnmt-admin.conf", "etc/nginx/conf.d/10-lnmt-admin.conf"),
+    ("/etc/systemd/system/lnmt-backup.service", "etc/systemd/system/lnmt-backup.service"),
+    ("/etc/systemd/system/lnmt-backup.timer", "etc/systemd/system/lnmt-backup.timer"),
+    ("/etc/systemd/system/lnmt-monitor.service", "etc/systemd/system/lnmt-monitor.service"),
+    ("/etc/systemd/system/lnmt-monitor.timer", "etc/systemd/system/lnmt-monitor.timer"),
+    ("/etc/systemd/system/lnmt-admin.socket", "etc/systemd/system/lnmt-admin.socket"),
+    ("/etc/systemd/system/lnmt-admin@.service", "etc/systemd/system/lnmt-admin@.service"),
+    ("/etc/systemd/system/lnmt-web.service", "etc/systemd/system/lnmt-web.service"),
+]
+
+EXPECTED_RELEASE_SHA = (
+    "7b254c655c78cc998f18c2129e7d61cd"
+    "6c107554aceffc5eb6916aea568c3fb2"
+)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+
+    return h.hexdigest()
+
+
+def run(args):
+    p = subprocess.run(
+        args,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return p.returncode, p.stdout.strip()
+
+
+def copy_item(src, dst):
+    src = pathlib.Path(src)
+    dst = pathlib.Path(dst)
+
+    if not src.exists() and not src.is_symlink():
+        return False
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if src.is_symlink():
+        dst.symlink_to(os.readlink(src))
+    elif src.is_dir():
+        shutil.copytree(
+            src,
+            dst,
+            symlinks=True,
+            dirs_exist_ok=True,
+        )
+    else:
+        shutil.copy2(src, dst)
+
+    return True
+
+
+def build_manifest(root):
+    entries = []
+
+    for p in sorted(root.rglob("*")):
+        rel = str(p.relative_to(root))
+
+        if p.is_symlink():
+            entries.append({
+                "path": rel,
+                "type": "symlink",
+                "target": os.readlink(p),
+            })
+
+        elif p.is_file():
+            st = p.stat()
+            entries.append({
+                "path": rel,
+                "type": "file",
+                "size": st.st_size,
+                "mode": oct(st.st_mode & 0o7777),
+                "uid": st.st_uid,
+                "gid": st.st_gid,
+                "sha256": sha256(p),
+            })
+
+        elif p.is_dir():
+            st = p.stat()
+            entries.append({
+                "path": rel,
+                "type": "directory",
+                "mode": oct(st.st_mode & 0o7777),
+                "uid": st.st_uid,
+                "gid": st.st_gid,
+            })
+
+    return entries
+
+
+def prune(output_dir, keep):
+    """Delete all but the newest `keep` lnmt-backup-*.tar.gz (and their .sha256);
+    other files there (release tarball, hand-made copies) are never touched."""
+    archives = sorted(output_dir.glob("lnmt-backup-*.tar.gz"))
+    for old in archives[:-keep]:
+        old.unlink(missing_ok=True)
+        old.with_name(old.name + ".sha256").unlink(missing_ok=True)
+        print(f"Pruned old backup: {old.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create a LAIka NGINx Management Terminal disaster-recovery backup."
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT),
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=0,
+        help="afterwards keep only the newest N lnmt-backup archives (0 = keep all)",
+    )
+
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        print("ERROR: lnmt-backup must run as root.")
+        return 2
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    os.chmod(output_dir, 0o700)
+
+    final = output_dir / f"lnmt-backup-{stamp}.tar.gz"
+
+    print("=" * 64)
+    print(" LNMT PROXY MANAGER — DISASTER RECOVERY BACKUP")
+    print("=" * 64)
+
+    # ---------------------------------------------------------
+    # Refuse to back up an obviously broken configuration.
+    # ---------------------------------------------------------
+
+    rc, out = run(["nginx", "-t"])
+
+    if rc != 0:
+        print("[FAIL] Nginx configuration is invalid.")
+        print(out)
+        print("Backup aborted.")
+        return 1
+
+    print("[PASS] Nginx configuration valid")
+
+    # ---------------------------------------------------------
+    # Verify canonical release before embedding it.
+    # ---------------------------------------------------------
+
+    release = pathlib.Path(
+        "/var/backups/lnmt/lnmt-v2.1-final.tar.gz"
+    )
+
+    if release.exists():
+        actual = sha256(release)
+
+        if actual != EXPECTED_RELEASE_SHA:
+            print("[FAIL] Final v2.1 release SHA256 mismatch")
+            print(f"Expected: {EXPECTED_RELEASE_SHA}")
+            print(f"Actual:   {actual}")
+            return 1
+
+        print("[PASS] Canonical v2.1 release verified")
+
+    else:
+        print(
+            "[WARN] Canonical v2.1 release archive is not "
+            "present in /tmp"
+        )
+
+    # ---------------------------------------------------------
+    # Build staging tree.
+    # ---------------------------------------------------------
+
+    staging_parent = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix="lnmt-backup-build-",
+            dir="/var/tmp",
+        )
+    )
+
+    root = staging_parent / "lnmt-backup"
+    root.mkdir()
+
+    try:
+        copied = []
+        missing = []
+
+        for src, rel in ITEMS:
+            if copy_item(src, root / rel):
+                copied.append(src)
+            else:
+                missing.append(src)
+
+
+        # -----------------------------------------------------
+        # LNMT-managed Nginx sites only
+        # -----------------------------------------------------
+
+        state_path = pathlib.Path(
+            "/var/lib/lnmt/state.json"
+        )
+
+        state = json.loads(state_path.read_text())
+        managed = state.get("proxies", {})
+
+        nginx_available = (
+            root / "etc/nginx/sites-available"
+        )
+        nginx_enabled = (
+            root / "etc/nginx/sites-enabled"
+        )
+
+        nginx_available.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        nginx_enabled.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        for hostname, proxy in managed.items():
+            live_available = pathlib.Path(
+                "/etc/nginx/sites-available"
+            ) / hostname
+
+            backup_available = (
+                nginx_available / hostname
+            )
+
+            if not live_available.is_file():
+                raise RuntimeError(
+                    f"LNMT-managed Nginx config missing: "
+                    f"{hostname}"
+                )
+
+            shutil.copy2(
+                live_available,
+                backup_available,
+            )
+
+            live_enabled = pathlib.Path(
+                "/etc/nginx/sites-enabled"
+            ) / hostname
+
+            if live_enabled.is_symlink():
+                backup_enabled = (
+                    nginx_enabled / hostname
+                )
+
+                backup_enabled.symlink_to(
+                    f"/etc/nginx/sites-available/{hostname}"
+                )
+
+        metadata = {
+            "format": 1,
+            "product": "LAIka NGINx Management Terminal",
+            "version": "2.1",
+            "created": datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+            "hostname": socket.gethostname(),
+            "release_sha256": (
+                EXPECTED_RELEASE_SHA
+                if release.exists()
+                else None
+            ),
+            "copied_sources": copied,
+            "missing_optional_sources": missing,
+        }
+
+        (root / "BACKUP-METADATA.json").write_text(
+            json.dumps(metadata, indent=2) + "\n"
+        )
+
+        # Manifest is generated last and intentionally does not
+        # contain a hash of itself.
+        manifest = build_manifest(root)
+
+        (root / "MANIFEST.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
+
+        # -----------------------------------------------------
+        # Archive with restrictive permissions.
+        # -----------------------------------------------------
+
+        old_umask = os.umask(0o077)
+
+        try:
+            with tarfile.open(
+                final,
+                "w:gz",
+                dereference=False,
+            ) as tf:
+                tf.add(
+                    root,
+                    arcname="lnmt-backup",
+                    recursive=True,
+                )
+        finally:
+            os.umask(old_umask)
+
+        os.chmod(final, 0o600)
+
+        # -----------------------------------------------------
+        # Verify archive can be read and expected metadata exists.
+        # -----------------------------------------------------
+
+        with tarfile.open(final, "r:gz") as tf:
+            names = set(tf.getnames())
+
+            required = {
+                "lnmt-backup/BACKUP-METADATA.json",
+                "lnmt-backup/MANIFEST.json",
+                "lnmt-backup/var/lib/lnmt",
+                "lnmt-backup/etc/lnmt",
+            }
+
+            absent = sorted(required - names)
+
+            if absent:
+                print("[FAIL] Backup archive verification failed:")
+                for name in absent:
+                    print(f"       missing: {name}")
+
+                final.unlink(missing_ok=True)
+                return 1
+
+        print("[PASS] Backup archive readable")
+        print("[PASS] Required recovery data present")
+
+        archive_sha = sha256(final)
+
+        sha_file = final.with_suffix(
+            final.suffix + ".sha256"
+        )
+
+        sha_file.write_text(
+            f"{archive_sha}  {final.name}\n"
+        )
+
+        os.chmod(sha_file, 0o600)
+
+        print()
+        print("=" * 64)
+        print(" BACKUP COMPLETE")
+        print("=" * 64)
+        print(f"Archive: {final}")
+        print(f"SHA256:  {archive_sha}")
+        print(f"Size:    {final.stat().st_size:,} bytes")
+
+        if missing:
+            print()
+            print("Optional/missing sources:")
+            for item in missing:
+                print(f"  - {item}")
+
+        print()
+        print(
+            "WARNING: This archive contains credentials, "
+            "private TLS keys, and password hashes."
+        )
+        print(
+            "Store it as securely as you would store the "
+            "server itself."
+        )
+
+        if args.keep > 0:
+            prune(output_dir, args.keep)
+
+        return 0
+
+    finally:
+        shutil.rmtree(
+            staging_parent,
+            ignore_errors=True,
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

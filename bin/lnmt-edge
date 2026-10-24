@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, "/usr/local/lib")
+from lnmt.edge import update_edge
+
+try:
+    d = update_edge()
+    print(f"Cloudflare edge trust updated: {len(d['ipv4_cidrs'])} IPv4, {len(d['ipv6_cidrs'])} IPv6 ranges")
+except Exception as e:
+    print(f"LNMT edge update FAILED: {e}", file=sys.stderr)
+    sys.exit(1)

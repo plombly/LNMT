@@ -1,0 +1,33 @@
+[Unit]
+Description=LAIka NGINx Management Terminal web dashboard (LAN/VPN via nginx on 8443)
+After=network.target lnmt-admin.socket
+Wants=lnmt-admin.socket
+
+[Service]
+User=lnmt-web
+Group=lnmt-web
+Environment=LNMT_WEB_DATA=/var/lib/lnmt-web
+ExecStart=/usr/local/sbin/lnmt-web serve
+Restart=on-failure
+UMask=0077
+# It needs nothing but its data folder and the admin socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/lnmt-web
+StateDirectory=lnmt-web
+StateDirectoryMode=0700
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=LAIka NGINx Management Terminal uptime checks every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Unit=lnmt-monitor.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=LAIka NGINx Management Terminal Cloudflare edge-trust updater
+Wants=network-online.target
+After=network-online.target nginx.service nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lnmt-edge
+User=root
+Group=root

@@ -1,0 +1,11 @@
+[Unit]
+Description=LAIka NGINx Management Terminal root action (one request)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lnmt-admin
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=360
+UMask=0077

@@ -1,0 +1,9 @@
+[Unit]
+Description=LAIka NGINx Management Terminal disaster-recovery backup
+After=nginx.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/local/sbin/lnmt-backup --keep 14

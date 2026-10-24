@@ -1,0 +1,8 @@
+[Unit]
+Description=LAIka NGINx Management Terminal DDNS update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lnmt-ddns

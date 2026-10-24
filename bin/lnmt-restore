@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import tarfile
+import tempfile
+
+EXPECTED_RELEASE_SHA = (
+    "7b254c655c78cc998f18c2129e7d61cd"
+    "6c107554aceffc5eb6916aea568c3fb2"
+)
+
+ARCHIVE_ROOT = pathlib.PurePosixPath("lnmt-backup")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_member_name(name):
+    p = pathlib.PurePosixPath(name)
+
+    if p.is_absolute():
+        raise RuntimeError(f"Absolute archive path rejected: {name}")
+
+    if ".." in p.parts:
+        raise RuntimeError(f"Path traversal rejected: {name}")
+
+    if not p.parts or p.parts[0] != "lnmt-backup":
+        raise RuntimeError(
+            f"Archive member outside lnmt-backup/: {name}"
+        )
+
+    return p
+
+
+def validate_nginx_symlink(member):
+    """
+    The backup is allowed to contain:
+
+      lnmt-backup/etc/nginx/sites-enabled/NAME
+        -> /etc/nginx/sites-available/NAME
+
+    Nothing else may use an absolute symlink.
+    """
+
+    member_path = validate_member_name(member.name)
+
+    expected_parent = pathlib.PurePosixPath(
+        "lnmt-backup/etc/nginx/sites-enabled"
+    )
+
+    if member_path.parent != expected_parent:
+        raise RuntimeError(
+            f"Symlink outside sites-enabled rejected: "
+            f"{member.name} -> {member.linkname}"
+        )
+
+    target = pathlib.PurePosixPath(member.linkname)
+
+    if not target.is_absolute():
+        raise RuntimeError(
+            f"Unexpected relative Nginx symlink: "
+            f"{member.name} -> {member.linkname}"
+        )
+
+    allowed_parent = pathlib.PurePosixPath(
+        "/etc/nginx/sites-available"
+    )
+
+    if target.parent != allowed_parent:
+        raise RuntimeError(
+            f"Unsafe Nginx symlink target rejected: "
+            f"{member.name} -> {member.linkname}"
+        )
+
+    # Enabled name must point to the identically named available site.
+    if target.name != member_path.name:
+        raise RuntimeError(
+            f"Nginx symlink name mismatch: "
+            f"{member.name} -> {member.linkname}"
+        )
+
+    return member_path, target
+
+
+def extract_safely(tf, work):
+    """
+    Extract regular files/directories using Python's data filter.
+
+    Validated Nginx sites-enabled symlinks are recreated manually
+    INSIDE the isolated extraction tree so they cannot escape it.
+    """
+
+    normal = []
+    symlinks = []
+
+    for member in tf.getmembers():
+        validate_member_name(member.name)
+
+        if member.isdev() or member.isfifo():
+            raise RuntimeError(
+                f"Special archive member rejected: {member.name}"
+            )
+
+        if member.issym():
+            symlinks.append(
+                (member, *validate_nginx_symlink(member))
+            )
+        elif member.islnk():
+            raise RuntimeError(
+                f"Hard link rejected: {member.name}"
+            )
+        else:
+            normal.append(member)
+
+    tf.extractall(
+        work,
+        members=normal,
+        filter="data",
+    )
+
+    root = work / "lnmt-backup"
+
+    for member, member_path, target in symlinks:
+        rel = pathlib.PurePosixPath(
+            *member_path.parts[1:]
+        )
+
+        local_link = root.joinpath(*rel.parts)
+
+        # Convert:
+        # /etc/nginx/sites-available/foo
+        #
+        # into an isolated link:
+        # ../sites-available/foo
+        local_target = pathlib.Path(
+            "..",
+            "sites-available",
+            target.name,
+        )
+
+        available = (
+            root
+            / "etc/nginx/sites-available"
+            / target.name
+        )
+
+        if not available.is_file():
+            raise RuntimeError(
+                f"Enabled site has no backed-up configuration: "
+                f"{target.name}"
+            )
+
+        local_link.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        local_link.symlink_to(local_target)
+
+
+def load_metadata(root):
+    metadata_path = root / "BACKUP-METADATA.json"
+    manifest_path = root / "MANIFEST.json"
+
+    if not metadata_path.is_file():
+        raise RuntimeError("BACKUP-METADATA.json missing")
+
+    if not manifest_path.is_file():
+        raise RuntimeError("MANIFEST.json missing")
+
+    metadata = json.loads(metadata_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+
+    if metadata.get("format") != 1:
+        raise RuntimeError(
+            f"Unsupported backup format: "
+            f"{metadata.get('format')!r}"
+        )
+
+    if metadata.get("product") != "LAIka NGINx Management Terminal":
+        raise RuntimeError(
+            "Archive is not a LAIka NGINx Management Terminal backup"
+        )
+
+    if not isinstance(manifest, list):
+        raise RuntimeError("MANIFEST.json is invalid")
+
+    return metadata, manifest
+
+
+def verify_manifest(root, manifest):
+    failures = []
+
+    for entry in manifest:
+        rel = entry.get("path")
+        kind = entry.get("type")
+
+        if not isinstance(rel, str):
+            failures.append("Manifest entry has invalid path")
+            continue
+
+        p = root / rel
+
+        if kind == "file":
+            if not p.is_file() or p.is_symlink():
+                failures.append(f"Missing/invalid file: {rel}")
+                continue
+
+            if sha256(p) != entry.get("sha256"):
+                failures.append(f"SHA256 mismatch: {rel}")
+
+        elif kind == "directory":
+            if not p.is_dir() or p.is_symlink():
+                failures.append(
+                    f"Missing/invalid directory: {rel}"
+                )
+
+        elif kind == "symlink":
+            if not p.is_symlink():
+                failures.append(f"Missing symlink: {rel}")
+                continue
+
+            # During isolated extraction we intentionally rewrite
+            # absolute live-system Nginx links into safe local links.
+            #
+            # Validate the semantic destination instead of requiring
+            # byte-identical link text.
+            original = pathlib.PurePosixPath(
+                entry.get("target", "")
+            )
+
+            if (
+                original.parent
+                != pathlib.PurePosixPath(
+                    "/etc/nginx/sites-available"
+                )
+            ):
+                failures.append(
+                    f"Unexpected manifest symlink: {rel}"
+                )
+                continue
+
+            expected_local = str(
+                pathlib.Path(
+                    "..",
+                    "sites-available",
+                    original.name,
+                )
+            )
+
+            if os.readlink(p) != expected_local:
+                failures.append(
+                    f"Symlink target mismatch: {rel}"
+                )
+
+        else:
+            failures.append(
+                f"Unknown manifest type {kind!r}: {rel}"
+            )
+
+    return failures
+
+
+def verify_required(root):
+    required = [
+        "var/lib/lnmt",
+        "etc/lnmt",
+        "etc/nginx/sites-available",
+        "etc/nginx/sites-enabled",
+        "etc/nginx/conf.d/cloudflare-realip.conf",
+        "etc/nginx/conf.d/00-lnmt-default-sink.conf",
+    ]
+
+    return [
+        rel
+        for rel in required
+        if not (root / rel).exists()
+        and not (root / rel).is_symlink()
+    ]
+
+
+def verify_release(root, metadata):
+    release = (
+        root
+        / "release"
+        / "lnmt-v2.1-final.tar.gz"
+    )
+
+    if not release.is_file():
+        return False, "Embedded v2.1 release missing"
+
+    if metadata.get("release_sha256") != EXPECTED_RELEASE_SHA:
+        return (
+            False,
+            "Backup metadata contains unexpected release SHA256",
+        )
+
+    actual = sha256(release)
+
+    if actual != EXPECTED_RELEASE_SHA:
+        return (
+            False,
+            "Embedded v2.1 release SHA256 mismatch",
+        )
+
+    return True, actual
+
+
+def classify_sites(root):
+    state_path = root / "var/lib/lnmt/state.json"
+
+    state = json.loads(state_path.read_text())
+    managed = set(state.get("proxies", {}).keys())
+
+    available_dir = root / "etc/nginx/sites-available"
+    enabled_dir = root / "etc/nginx/sites-enabled"
+
+    sites = []
+
+    for p in sorted(available_dir.iterdir()):
+        if not p.is_file():
+            continue
+
+        name = p.name
+
+        # Ubuntu's stock default isn't one of our proxy sites.
+        if name == "default":
+            continue
+
+        sites.append({
+            "name": name,
+            "managed": name in managed,
+            "enabled": (enabled_dir / name).is_symlink(),
+        })
+
+    return sites
+
+
+def inspect_backup(archive, keep=False):
+    archive = pathlib.Path(archive)
+
+    if not archive.is_file():
+        raise RuntimeError(
+            f"Backup archive not found: {archive}"
+        )
+
+    work = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix="lnmt-restore-verify-",
+            dir="/var/tmp",
+        )
+    )
+
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            extract_safely(tf, work)
+
+        root = work / "lnmt-backup"
+
+        metadata, manifest = load_metadata(root)
+
+        failures = verify_manifest(root, manifest)
+        missing = verify_required(root)
+
+        release_ok, release_detail = verify_release(
+            root,
+            metadata,
+        )
+
+        sites = classify_sites(root)
+
+        return {
+            "work": work,
+            "root": root,
+            "metadata": metadata,
+            "manifest": manifest,
+            "manifest_failures": failures,
+            "required_missing": missing,
+            "release_ok": release_ok,
+            "release_detail": release_detail,
+            "sites": sites,
+        }
+
+    except Exception:
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def show_sites(sites):
+    print()
+    print("Recovered Nginx site inventory:")
+
+    for site in sites:
+        owner = (
+            "LNMT-MANAGED"
+            if site["managed"]
+            else "EXTERNAL/UNMANAGED"
+        )
+
+        status = (
+            "ENABLED"
+            if site["enabled"]
+            else "DISABLED"
+        )
+
+        print(
+            f"  {site['name']}: "
+            f"{owner}, {status}"
+        )
+
+
+def verify_command(archive):
+    print("=" * 68)
+    print(" LNMT PROXY MANAGER — RESTORE VERIFICATION")
+    print("=" * 68)
+
+    result = inspect_backup(archive)
+
+    try:
+        metadata = result["metadata"]
+
+        print(
+            f"Backup version: {metadata.get('version', 'unknown')}"
+        )
+        print(
+            f"Created:        {metadata.get('created', 'unknown')}"
+        )
+        print(
+            f"Source host:    {metadata.get('hostname', 'unknown')}"
+        )
+        print()
+
+        failures = 0
+
+        if result["manifest_failures"]:
+            print("[FAIL] Manifest verification")
+            failures += len(result["manifest_failures"])
+
+            for item in result["manifest_failures"]:
+                print(f"       {item}")
+        else:
+            print(
+                f"[PASS] Manifest verification "
+                f"({len(result['manifest'])} entries)"
+            )
+
+        if result["required_missing"]:
+            print("[FAIL] Required recovery data")
+            failures += len(result["required_missing"])
+
+            for item in result["required_missing"]:
+                print(f"       missing: {item}")
+        else:
+            print("[PASS] Required recovery data present")
+
+        if result["release_ok"]:
+            print("[PASS] Embedded v2.1 release verified")
+        else:
+            print(
+                f"[FAIL] Embedded release: "
+                f"{result['release_detail']}"
+            )
+            failures += 1
+
+        show_sites(result["sites"])
+
+        print()
+
+        if failures:
+            print("FINAL RESULT: FAIL")
+            return 1
+
+        print("FINAL RESULT: PASS")
+        return 0
+
+    finally:
+        shutil.rmtree(
+            result["work"],
+            ignore_errors=True,
+        )
+
+
+def extract_test_command(archive):
+    print("=" * 68)
+    print(" LNMT PROXY MANAGER — ISOLATED RESTORE TEST")
+    print("=" * 68)
+
+    result = inspect_backup(
+        archive,
+        keep=True,
+    )
+
+    failures = (
+        len(result["manifest_failures"])
+        + len(result["required_missing"])
+        + (0 if result["release_ok"] else 1)
+    )
+
+    if failures:
+        print("[FAIL] Backup verification failed.")
+        print(f"Retained at: {result['work']}")
+        return 1
+
+    root = result["root"]
+
+    print("[PASS] Archive safely extracted")
+    print("[PASS] Manifest hashes match")
+    print("[PASS] Nginx symlinks safely reconstructed")
+    print("[PASS] Required recovery tree reconstructed")
+    print("[PASS] Embedded v2.1 release verified")
+
+    state = json.loads(
+        (
+            root / "var/lib/lnmt/state.json"
+        ).read_text()
+    )
+
+    print(
+        f"[PASS] LNMT state parses "
+        f"({len(state.get('proxies', {}))} managed proxy/proxies)"
+    )
+
+    credentials = root / "etc/lnmt/credentials"
+
+    if credentials.exists():
+        if credentials.is_dir():
+            bad = []
+
+            for item in credentials.rglob("*"):
+                if item.is_file() and not item.is_symlink():
+                    mode = item.stat().st_mode & 0o777
+
+                    if mode & 0o077:
+                        bad.append(
+                            f"{item.relative_to(root)} "
+                            f"({oct(mode)})"
+                        )
+
+            if bad:
+                print(
+                    "[FAIL] Credential file permissions "
+                    "too broad:"
+                )
+
+                for item in bad:
+                    print(f"       {item}")
+
+                return 1
+
+            print(
+                "[PASS] Credential directory restored; "
+                "sensitive files remain restricted"
+            )
+
+        elif credentials.is_file():
+            mode = credentials.stat().st_mode & 0o777
+
+            if mode & 0o077:
+                print(
+                    f"[FAIL] Credentials permissions "
+                    f"too broad: {oct(mode)}"
+                )
+                return 1
+
+            print(
+                f"[PASS] Credential permissions preserved "
+                f"({oct(mode)})"
+            )
+
+    show_sites(result["sites"])
+
+    print()
+    print("ISOLATED RESTORE RESULT: PASS")
+    print()
+    print(f"Test tree: {result['work']}")
+    print(
+        "Contains sensitive recovery data; remove after testing."
+    )
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LAIka NGINx Management Terminal disaster recovery utility."
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+
+    mode.add_argument(
+        "--verify",
+        action="store_true",
+    )
+
+    mode.add_argument(
+        "--extract-test",
+        action="store_true",
+    )
+
+    parser.add_argument("archive")
+
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        print("ERROR: lnmt-restore must run as root.")
+        return 2
+
+    try:
+        if args.verify:
+            return verify_command(args.archive)
+
+        return extract_test_command(args.archive)
+
+    except Exception as e:
+        print(f"[FAIL] {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
