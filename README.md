@@ -25,11 +25,16 @@ The dashboard is for your LAN and VPN only: it listens on port 8443 and the
 installer limits it to the networks in `/etc/lnmt/lnmt.env`
 (`LNMT_TRUSTED_NETS`). Never expose it to the internet.
 
-## Status
+## Install
 
-LNMT runs in production for its author. The installer in this repository
-(`bin/install-web.sh`) installs and updates the dashboard on an existing LNMT
-edge server; a one-step installer for a fresh server is not included yet.
+On a fresh Debian or Ubuntu server:
+
+```
+git clone https://github.com/plombly/LNMT.git && cd LNMT
+sudo LNMT_TRUSTED_NETS="192.168.1.0/24" bash bin/install.sh
+```
+
+See [Installing LNMT](docs/install.md).
 
 ## Layout
 

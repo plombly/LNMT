@@ -71,8 +71,11 @@ systemctl reload nginx
 rm -f "$OLD"
 
 # 5. Firewall: 8443 from the LAN and the VPN only (runtime + saved file).
+# (The listing is read first: "nft list | grep -q" under pipefail fails
+# whenever grep stops reading early, and added the rule again on every run.)
+RULES=$(nft list chain inet filter input)
 for net in $LNMT_TRUSTED_NETS; do
-  nft list chain inet filter input | grep -q "ip saddr $net tcp dport 8443 accept" || \
+  grep -q "ip saddr $net tcp dport 8443 accept" <<<"$RULES" || \
     nft add rule inet filter input ip saddr "$net" tcp dport 8443 accept
 done
 if ! grep -q "dport 8443" /etc/nftables.conf; then
